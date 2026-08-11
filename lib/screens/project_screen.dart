@@ -311,7 +311,7 @@ class _ProjectScreenState extends State<ProjectScreen>
         },
 
         decoration: InputDecoration(
-          hintText: '검색 (예: 0038 01)',
+          hintText: '검색 (예: POW 7002)',
 
           prefixIcon: const Icon(
             Icons.search,
