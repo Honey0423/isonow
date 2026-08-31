@@ -52,7 +52,7 @@ class HomeScreen extends StatelessWidget {
 
             Card(
               child: ListTile(
-                title: const Text('M16X Project'),
+                title: const Text('P&T7 Project'),
                 subtitle: const Text('ISO 도면 관리'),
                 trailing: const Icon(Icons.arrow_forward),
                 onTap: () {
@@ -61,7 +61,7 @@ class HomeScreen extends StatelessWidget {
                     context,
                     MaterialPageRoute(
                       builder: (context) => const ProjectScreen(
-                        projectName: 'M15X Project',
+                        projectName: 'P&T7 Project',
                       ),
                     ),
                   );
