@@ -1,0 +1,29 @@
+{
+  "project_info": {
+    "project_number": "667935535397",
+    "project_id": "isonow-ecdb2",
+    "storage_bucket": "isonow-ecdb2.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:667935535397:android:59947a246aae2d865f6acc",
+        "android_client_info": {
+          "package_name": "com.example.isonow"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyDTEzvKMVmcnFefWW7qj2gikvwtNpgNMKo"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}
