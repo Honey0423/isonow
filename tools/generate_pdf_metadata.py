@@ -5,16 +5,30 @@ from datetime import datetime
 
 
 # =========================================================
-# 폴더 설정
+# 현장별 도면 메타데이터 생성
+#
+# 폴더 구조:
+#
+#   assets/sites/{현장이름}/iso/        ISO PDF
+#   assets/sites/{현장이름}/pkg/        PKG PDF
+#   assets/sites/{현장이름}/plan_dwg/   Plan DWG / DXF
+#
+# 현장이름은 Firestore projects 문서의 name과 같아야 한다. (예: M17)
+#
+# 실행 (isonow 폴더에서):
+#
+#   python tools/generate_pdf_metadata.py
+#
+# 결과:
+#   - 현장마다 iso_metadata.json / pkg_metadata.json / plan_metadata.json 생성
+#   - pubspec.yaml의 SITE ASSETS 블록을 현장 폴더 목록으로 갱신
 # =========================================================
 
-ISO_DIR = Path("assets/iso")
-PKG_DIR = Path("assets/pkg")
-PLAN_DIR = Path("assets/plan_dwg")
+SITES_DIR = Path("assets/sites")
+PUBSPEC = Path("pubspec.yaml")
 
-ISO_OUTPUT = Path("assets/iso_metadata.json")
-PKG_OUTPUT = Path("assets/pkg_metadata.json")
-PLAN_OUTPUT = Path("assets/plan_metadata.json")
+ASSETS_START = "# ===== SITE ASSETS START ====="
+ASSETS_END = "# ===== SITE ASSETS END ====="
 
 
 # =========================================================
@@ -29,17 +43,22 @@ def get_modified_date(file):
     return modified_time.strftime("%Y-%m-%d")
 
 
+def asset_path(file):
+    # Flutter asset 경로는 항상 / 사용
+    return file.as_posix()
+
+
 # =========================================================
 # ISO
-#
-# 기존에 잘 되던 로직 그대로
 # =========================================================
 
-iso_files = []
+def build_iso(iso_dir):
+    iso_files = []
 
-if ISO_DIR.exists():
+    if not iso_dir.exists():
+        return iso_files
 
-    for file in ISO_DIR.iterdir():
+    for file in iso_dir.iterdir():
 
         if not file.is_file():
             continue
@@ -52,8 +71,6 @@ if ISO_DIR.exists():
             continue
 
         file_name = file.name
-
-        # .pdf 제거
         base_name = file.stem
 
         # -----------------------------------------
@@ -71,12 +88,8 @@ if ISO_DIR.exists():
         )
 
         if revision_match:
+            revision_number = int(revision_match.group(1))
 
-            revision_number = int(
-                revision_match.group(1)
-            )
-
-            # _Rev00 제거
             iso_name = re.sub(
                 r"_Rev\d+$",
                 "",
@@ -87,50 +100,41 @@ if ISO_DIR.exists():
             revision = f"Rev.{revision_number:02d}"
 
         else:
-
+            revision_number = -1
             iso_name = base_name
             revision = "Rev.?"
-
-        # -----------------------------------------
-        # 실제 파일 최종 수정 날짜
-        # -----------------------------------------
-
-        modified_date = get_modified_date(file)
 
         iso_files.append({
             "fileName": file_name,
             "isoName": iso_name,
             "revision": revision,
-            "revisionNumber": (
-                revision_number
-                if revision_match
-                else -1
-            ),
-            "modifiedDate": modified_date,
-            "path": f"assets/iso/{file_name}",
+            "revisionNumber": revision_number,
+            "modifiedDate": get_modified_date(file),
+            "path": asset_path(file),
         })
 
-
-# ISO 이름 → Revision 순서
-iso_files.sort(
-    key=lambda x: (
-        x["isoName"],
-        x["revisionNumber"]
+    # ISO 이름 → Revision 순서
+    iso_files.sort(
+        key=lambda x: (
+            x["isoName"],
+            x["revisionNumber"]
+        )
     )
-)
+
+    return iso_files
 
 
 # =========================================================
 # PKG
-#
-# assets/pkg/ 안의 PDF를 전부 읽음
 # =========================================================
 
-pkg_files = []
+def build_pkg(pkg_dir):
+    pkg_files = []
 
-if PKG_DIR.exists():
+    if not pkg_dir.exists():
+        return pkg_files
 
-    for file in PKG_DIR.iterdir():
+    for file in pkg_dir.iterdir():
 
         if not file.is_file():
             continue
@@ -142,87 +146,63 @@ if PKG_DIR.exists():
         if "■삭제" in file.name:
             continue
 
-        file_name = file.name
-
-        # .pdf 제거
-        base_name = file.stem
-
-        modified_date = get_modified_date(file)
-
         pkg_files.append({
-            "fileName": file_name,
-            "pkgName": base_name,
-            "modifiedDate": modified_date,
-            "path": f"assets/pkg/{file_name}",
+            "fileName": file.name,
+            "pkgName": file.stem,
+            "modifiedDate": get_modified_date(file),
+            "path": asset_path(file),
         })
 
+    pkg_files.sort(
+        key=lambda x: x["fileName"].lower()
+    )
 
-# 파일명 기준 정렬
-pkg_files.sort(
-    key=lambda x: x["fileName"].lower()
-)
+    return pkg_files
 
 
 # =========================================================
-# PLAN
-#
-# assets/plan_dwg/
-#
-# DWG / DXF 모두 읽음
+# PLAN (DWG / DXF)
 # =========================================================
 
-plan_files = []
+def build_plan(plan_dir):
+    plan_files = []
 
-if PLAN_DIR.exists():
+    if not plan_dir.exists():
+        return plan_files
 
-    for file in PLAN_DIR.iterdir():
+    for file in plan_dir.iterdir():
 
         if not file.is_file():
             continue
 
-        if file.suffix.lower() not in [
-            ".dwg",
-            ".dxf",
-        ]:
+        if file.suffix.lower() not in [".dwg", ".dxf"]:
             continue
 
         # ■삭제 파일 제외
         if "■삭제" in file.name:
             continue
 
-        file_name = file.name
-
-        base_name = file.stem
-
-        modified_date = get_modified_date(file)
-
         plan_files.append({
-            "fileName": file_name,
-            "planName": base_name,
+            "fileName": file.name,
+            "planName": file.stem,
             "extension": file.suffix.lower(),
-            "modifiedDate": modified_date,
-            "path": f"assets/plan_dwg/{file_name}",
+            "modifiedDate": get_modified_date(file),
+            "path": asset_path(file),
         })
 
+    plan_files.sort(
+        key=lambda x: x["fileName"].lower()
+    )
 
-# 파일명 기준 정렬
-plan_files.sort(
-    key=lambda x: x["fileName"].lower()
-)
+    return plan_files
 
 
 # =========================================================
-# JSON 저장 함수
+# JSON 저장
 # =========================================================
 
 def save_json(data, output_file):
-
-    with open(
-        output_file,
-        "w",
-        encoding="utf-8"
-    ) as f:
-
+    with open(output_file, "w", encoding="utf-8") as f:
         json.dump(
             data,
             f,
@@ -232,51 +212,111 @@ def save_json(data, output_file):
 
 
 # =========================================================
-# 저장
+# pubspec.yaml SITE ASSETS 블록 갱신
+#
+# Flutter는 하위 폴더를 자동으로 포함하지 않으므로
+# 현장 폴더와 iso / pkg / plan_dwg 폴더를 각각 등록한다.
 # =========================================================
 
-save_json(
-    iso_files,
-    ISO_OUTPUT
-)
+def update_pubspec(asset_dirs):
+    if not PUBSPEC.exists():
+        print("pubspec.yaml을 찾지 못했습니다. (isonow 폴더에서 실행하세요)")
+        return False
 
-save_json(
-    pkg_files,
-    PKG_OUTPUT
-)
+    raw = PUBSPEC.read_bytes().decode("utf-8")
+    newline = "\r\n" if "\r\n" in raw else "\n"
+    lines = raw.split(newline)
 
-save_json(
-    plan_files,
-    PLAN_OUTPUT
-)
+    start = next(
+        (i for i, line in enumerate(lines) if ASSETS_START in line),
+        -1,
+    )
+    end = next(
+        (i for i, line in enumerate(lines) if ASSETS_END in line),
+        -1,
+    )
+
+    if start < 0 or end < 0 or end < start:
+        print("pubspec.yaml에서 SITE ASSETS 블록을 찾지 못했습니다.")
+        return False
+
+    indent = lines[start][: len(lines[start]) - len(lines[start].lstrip())]
+
+    block = [
+        lines[start],
+        f"{indent}# 현장별 도면 폴더. tools/generate_pdf_metadata.py가 자동으로 갱신합니다.",
+    ]
+
+    for d in asset_dirs:
+        block.append(f"{indent}- {d}")
+
+    block.append(lines[end])
+
+    new_lines = lines[:start] + block + lines[end + 1:]
+
+    PUBSPEC.write_bytes(newline.join(new_lines).encode("utf-8"))
+
+    return True
 
 
 # =========================================================
-# 결과 출력
+# 실행
 # =========================================================
 
-print()
-print("========================================")
-print("       ISONow Metadata 생성 완료")
-print("========================================")
+def main():
+    if not SITES_DIR.exists():
+        print(f"{SITES_DIR} 폴더가 없습니다.")
+        print("assets/sites/{현장이름}/iso, pkg, plan_dwg 구조로 도면을 넣어주세요.")
+        return
 
-print()
-print(
-    f"ISO     : {len(iso_files)}개"
-)
+    site_dirs = sorted(
+        [d for d in SITES_DIR.iterdir() if d.is_dir()],
+        key=lambda d: d.name.lower(),
+    )
 
-print(
-    f"PKG     : {len(pkg_files)}개"
-)
+    if not site_dirs:
+        print(f"{SITES_DIR} 안에 현장 폴더가 없습니다.")
+        return
 
-print(
-    f"플랜도  : {len(plan_files)}개"
-)
+    asset_dirs = []
 
-print()
-print(f"ISO 저장     : {ISO_OUTPUT}")
-print(f"PKG 저장     : {PKG_OUTPUT}")
-print(f"플랜도 저장  : {PLAN_OUTPUT}")
+    print()
+    print("========================================")
+    print("       ISONow Metadata 생성 (현장별)")
+    print("========================================")
 
-print()
-print("========================================")
+    for site_dir in site_dirs:
+        iso_dir = site_dir / "iso"
+        pkg_dir = site_dir / "pkg"
+        plan_dir = site_dir / "plan_dwg"
+
+        iso_files = build_iso(iso_dir)
+        pkg_files = build_pkg(pkg_dir)
+        plan_files = build_plan(plan_dir)
+
+        save_json(iso_files, site_dir / "iso_metadata.json")
+        save_json(pkg_files, site_dir / "pkg_metadata.json")
+        save_json(plan_files, site_dir / "plan_metadata.json")
+
+        asset_dirs.append(f"{asset_path(site_dir)}/")
+
+        for sub in (iso_dir, pkg_dir, plan_dir):
+            if sub.exists():
+                asset_dirs.append(f"{asset_path(sub)}/")
+
+        print()
+        print(f"[{site_dir.name}]")
+        print(f"  ISO     : {len(iso_files)}개")
+        print(f"  PKG     : {len(pkg_files)}개")
+        print(f"  플랜도  : {len(plan_files)}개")
+
+    print()
+
+    if update_pubspec(asset_dirs):
+        print("pubspec.yaml assets 갱신 완료")
+
+    print("========================================")
+
+
+if __name__ == "__main__":
+    main()
