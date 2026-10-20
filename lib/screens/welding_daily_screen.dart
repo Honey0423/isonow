@@ -1,3 +1,5 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 
 import '../services/welding_test_service.dart';
@@ -33,6 +35,22 @@ class _WeldingDailyScreenState
       _tableHorizontalController =
       ScrollController();
 
+  // =========================================================
+  // ISO(DWG_NAME) 검색 - Everything 방식
+  //
+  // 도면 이름 목록(weldingLogMeta 1건)에서 바로 걸러내고,
+  // 맞는 도면이 30개 이하면 그 도면들의 Point만 불러온다.
+  // =========================================================
+
+  final TextEditingController _isoSearchController =
+      TextEditingController();
+
+  Timer? _isoSearchDebounce;
+
+  List<String> _dwgNames = [];
+
+  List<String> _matchedDwgNames = [];
+
   @override
   void initState() {
     super.initState();
@@ -51,6 +69,18 @@ class _WeldingDailyScreenState
   }
 
   Future<void> _load() async {
+    // 검색용 도면 이름 목록 (문서 1건)
+    final names =
+        await service.getWeldingDwgNames(
+      widget.projectId,
+    );
+
+    if (mounted) {
+      setState(() {
+        _dwgNames = names;
+      });
+    }
+
     await service.loadWeldingLogs(
       widget.projectId,
     );
@@ -62,8 +92,227 @@ class _WeldingDailyScreenState
     setState(() {});
   }
 
+  // =========================================================
+  // ISO 검색
+  // =========================================================
+
+  List<String> _isoSearchKeywords(
+    String value,
+  ) {
+    return value
+        .toLowerCase()
+        .trim()
+        .split(RegExp(r'\s+'))
+        .where((k) => k.isNotEmpty)
+        .toList();
+  }
+
+  // 검색어가 모두 들어간 도면 이름 (예: "9073" / "9073 01" / "air 9073")
+  List<String> _matchDwgNames(
+    String value,
+  ) {
+    final keywords = _isoSearchKeywords(value);
+
+    if (keywords.isEmpty) {
+      return [];
+    }
+
+    return _dwgNames.where((name) {
+      final lower = name.toLowerCase();
+      return keywords.every(lower.contains);
+    }).toList();
+  }
+
+  void _onIsoSearchChanged(
+    String value,
+  ) {
+    setState(() {
+      _matchedDwgNames = _matchDwgNames(value);
+    });
+
+    _isoSearchDebounce?.cancel();
+
+    _isoSearchDebounce = Timer(
+      const Duration(milliseconds: 350),
+      () => _runIsoSearch(value),
+    );
+  }
+
+  Future<void> _runIsoSearch(
+    String value,
+  ) async {
+    final keywords = _isoSearchKeywords(value);
+
+    if (keywords.isEmpty) {
+      await service.clearIsoNoSearch(
+        widget.projectId,
+      );
+      return;
+    }
+
+    // 도면 목록이 없으면 (엑셀 재업로드 전) 입력값 그대로 정확히 검색
+    if (_dwgNames.isEmpty) {
+      await service.applyIsoNoSearch(
+        projectId: widget.projectId,
+        isoNos: [value.trim()],
+      );
+      return;
+    }
+
+    final matched = _matchDwgNames(value);
+
+    // 너무 많으면 조회하지 않고 아래 목록에서 고르게 한다 (읽기 비용 방지)
+    if (matched.length >
+        WeldingTestService.maxIsoSearchNames) {
+      return;
+    }
+
+    await service.applyIsoNoSearch(
+      projectId: widget.projectId,
+      isoNos: matched,
+    );
+  }
+
+  void _selectDwgName(
+    String name,
+  ) {
+    _isoSearchDebounce?.cancel();
+
+    _isoSearchController.text = name;
+
+    setState(() {
+      _matchedDwgNames = [name];
+    });
+
+    service.applyIsoNoSearch(
+      projectId: widget.projectId,
+      isoNos: [name],
+    );
+  }
+
+  void _clearIsoSearch() {
+    _isoSearchDebounce?.cancel();
+    _isoSearchController.clear();
+
+    setState(() {
+      _matchedDwgNames = [];
+    });
+
+    service.clearIsoNoSearch(
+      widget.projectId,
+    );
+  }
+
+  Widget _buildIsoSearch() {
+    final text = _isoSearchController.text;
+    final hasText = text.trim().isNotEmpty;
+    final matchCount = _matchedDwgNames.length;
+    final tooMany = matchCount >
+        WeldingTestService.maxIsoSearchNames;
+
+    String info;
+
+    if (!hasText) {
+      info = _dwgNames.isEmpty
+          ? '도면 목록이 없어 DWG_NAME 전체를 정확히 입력해야 검색됩니다. (엑셀 재업로드 시 부분 검색 가능)'
+          : '도면 ${_dwgNames.length}개 · 번호 일부만 입력해도 됩니다 (예: 9073, 9073 01)';
+    } else if (_dwgNames.isEmpty) {
+      info = '정확히 일치하는 DWG_NAME 검색';
+    } else if (matchCount == 0) {
+      info = '일치하는 도면이 없습니다.';
+    } else if (tooMany) {
+      info = '일치 도면 $matchCount개 · 30개 이하가 되도록 더 입력하거나 아래에서 선택하세요.';
+    } else {
+      info = '일치 도면 $matchCount개의 Point를 표시합니다.';
+    }
+
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Row(
+          children: [
+            Expanded(
+              child: TextField(
+                controller: _isoSearchController,
+                onChanged: _onIsoSearchChanged,
+                decoration: InputDecoration(
+                  hintText: 'ISO 검색 (예: 9073 / 9073 01 / AIR 9073)',
+                  prefixIcon: const Icon(Icons.search),
+                  suffixIcon: hasText
+                      ? IconButton(
+                          icon: const Icon(Icons.clear),
+                          onPressed: _clearIsoSearch,
+                        )
+                      : null,
+                  isDense: true,
+                  border: OutlineInputBorder(
+                    borderRadius: BorderRadius.circular(10),
+                  ),
+                ),
+              ),
+            ),
+
+            const SizedBox(width: 8),
+
+            // 기존 상세 필터 (CODE / COMMODITY / Floor / Welder)
+            OutlinedButton.icon(
+              onPressed: _showFilterDialog,
+              icon: const Icon(
+                Icons.tune,
+                size: 18,
+              ),
+              label: const Text('상세 필터'),
+            ),
+          ],
+        ),
+
+        const SizedBox(height: 6),
+
+        Text(
+          info,
+          style: TextStyle(
+            fontSize: 12,
+            color: hasText && matchCount == 0 && _dwgNames.isNotEmpty
+                ? Colors.red.shade400
+                : Colors.grey.shade600,
+          ),
+        ),
+
+        // 일치 도면 목록 (눌러서 하나만 보기)
+        if (hasText && matchCount > 1)
+          Container(
+            margin: const EdgeInsets.only(top: 6),
+            constraints: const BoxConstraints(
+              maxHeight: 96,
+            ),
+            child: SingleChildScrollView(
+              child: Wrap(
+                spacing: 6,
+                runSpacing: 6,
+                children: _matchedDwgNames
+                    .take(200)
+                    .map(
+                      (name) => ActionChip(
+                        label: Text(
+                          name,
+                          style: const TextStyle(fontSize: 11),
+                        ),
+                        visualDensity: VisualDensity.compact,
+                        onPressed: () => _selectDwgName(name),
+                      ),
+                    )
+                    .toList(),
+              ),
+            ),
+          ),
+      ],
+    );
+  }
+
   @override
   void dispose() {
+    _isoSearchDebounce?.cancel();
+    _isoSearchController.dispose();
     _tableHorizontalController.dispose();
 
     service.removeListener(
@@ -427,93 +676,10 @@ class _WeldingDailyScreenState
           const SizedBox(height: 15),
 
           // ===================================================
-          // 필터
+          // ISO 검색 + 상세 필터
           // ===================================================
 
-          Container(
-            width: double.infinity,
-            padding:
-                const EdgeInsets.all(12),
-            decoration: BoxDecoration(
-              color: Colors.grey.shade50,
-              border: Border.all(
-                color: Colors.grey.shade300,
-              ),
-              borderRadius:
-                  BorderRadius.circular(10),
-            ),
-            child: Row(
-              children: [
-                _buildFilterInfo(
-                  title: 'CODE',
-                  value:
-                      service.filterCode.isEmpty
-                          ? '전체'
-                          : service.filterCode,
-                  flex: 1,
-                ),
-
-                const SizedBox(width: 8),
-
-                _buildFilterInfo(
-                  title: 'COMMODITY',
-                  value:
-                      service.filterCommodity.isEmpty
-                          ? '전체'
-                          : service.filterCommodity,
-                  flex: 1,
-                ),
-
-                const SizedBox(width: 8),
-
-                _buildFilterInfo(
-                  title: 'Floor',
-                  value:
-                      service.filterFloor.isEmpty
-                          ? '전체'
-                          : service.filterFloor,
-                ),
-
-                const SizedBox(width: 8),
-
-                _buildFilterInfo(
-                  title: 'DWG_NAME',
-                  value:
-                      service.filterIsoNo.isEmpty
-                          ? '전체'
-                          : service.filterIsoNo,
-                  flex: 2,
-                ),
-
-                const SizedBox(width: 8),
-
-                _buildFilterInfo(
-                  title: 'Welder No.',
-                  value:
-                      service.filterWelderNo.isEmpty
-                          ? '전체'
-                          : service.filterWelderNo,
-                  flex: 1,
-                ),
-
-                const SizedBox(width: 10),
-
-                FilledButton.icon(
-                  onPressed:
-                      _showFilterDialog,
-                  icon: const Icon(
-                    Icons.filter_alt,
-                    size: 18,
-                  ),
-                  label: Text(
-                    service.hasWeldingLogFilter
-                        ? '필터 적용됨'
-                        : '필터',
-                  ),
-                ),
-              ],
-            ),
-          ),
+          _buildIsoSearch(),
 
           const SizedBox(height: 8),
 
@@ -543,71 +709,6 @@ class _WeldingDailyScreenState
             ],
           ),
         ],
-      ),
-    );
-  }
-
-  // =========================================================
-  // 필터 정보
-  // =========================================================
-
-  Widget _buildFilterInfo({
-    required String title,
-    required String value,
-    int flex = 1,
-  }) {
-    return Expanded(
-      flex: flex,
-      child: Container(
-        padding:
-            const EdgeInsets.symmetric(
-          horizontal: 11,
-          vertical: 8,
-        ),
-        decoration:
-            BoxDecoration(
-          color:
-              Colors.white,
-          border:
-              Border.all(
-            color:
-                Colors.grey.shade300,
-          ),
-          borderRadius:
-              BorderRadius.circular(
-            7,
-          ),
-        ),
-        child: Column(
-          crossAxisAlignment:
-              CrossAxisAlignment.start,
-          children: [
-            Text(
-              title,
-              style:
-                  TextStyle(
-                fontSize: 10,
-                color:
-                    Colors.grey.shade600,
-              ),
-            ),
-            const SizedBox(
-              height: 3,
-            ),
-            Text(
-              value,
-              maxLines: 1,
-              overflow:
-                  TextOverflow.ellipsis,
-              style:
-                  const TextStyle(
-                fontSize: 13,
-                fontWeight:
-                    FontWeight.bold,
-              ),
-            ),
-          ],
-        ),
       ),
     );
   }

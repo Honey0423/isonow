@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 import 'package:firebase_auth/firebase_auth.dart';
 import 'package:cloud_firestore/cloud_firestore.dart';
 
+import 'daily_work_report_screen.dart';
 import 'project_screen.dart';
 import 'welding_daily_screen.dart';
 
@@ -40,6 +41,9 @@ class _HomeScreenState extends State<HomeScreen> {
       FirebaseFirestore.instance;
 
   String _role = 'user';
+
+  // 승인된 현장 ID 목록 (users.projects)
+  List<String> _projects = [];
 
   bool _isLoadingRole = true;
 
@@ -87,6 +91,11 @@ class _HomeScreenState extends State<HomeScreen> {
           _role =
               data?['role']?.toString() ?? 'user';
 
+          final projects = data?['projects'];
+          _projects = projects is List
+              ? projects.map((e) => e.toString()).toList()
+              : [];
+
           _isLoadingRole = false;
         });
       } else {
@@ -112,15 +121,31 @@ class _HomeScreenState extends State<HomeScreen> {
   }
 
   // =========================================================
-  // 공사일보 접근 권한
+  // 이 현장의 admin 이상
   //
-  // super_admin
-  // admin
+  // super_admin: 모든 현장
+  // admin: 이 현장이 승인된 경우만
   // =========================================================
 
-  bool get _canAccessDailyReport {
-    return _role == 'super_admin' ||
-        _role == 'admin';
+  bool get _isSiteAdmin {
+    if (_role == 'super_admin') {
+      return true;
+    }
+
+    return _role == 'admin' &&
+        _projects.contains(widget.projectId);
+  }
+
+  void _openDailyWorkReport() {
+    Navigator.push(
+      context,
+      MaterialPageRoute(
+        builder: (context) => DailyWorkReportScreen(
+          projectId: widget.projectId,
+          projectName: widget.projectName,
+        ),
+      ),
+    );
   }
 
   // =========================================================
@@ -245,9 +270,21 @@ class _HomeScreenState extends State<HomeScreen> {
 
           if (SHOW_DAILY_REPORT &&
               !_isLoadingRole &&
-              _canAccessDailyReport) ...[
+              _isSiteAdmin) ...[
             const SizedBox(
               height: 10,
+            ),
+
+            // ===================================================
+            // 물량 집계 (일간/주간/월간) - 현장 admin 이상
+            // ===================================================
+
+            _MenuCard(
+              icon: Icons.event_note,
+              title: '물량 집계',
+              description:
+                  '일간 · 주간 · 월간 용접 물량 (Point · D/I · 용접사별) · 달력',
+              onTap: _openDailyWorkReport,
             ),
 
             _MenuCard(

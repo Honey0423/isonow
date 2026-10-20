@@ -51,6 +51,9 @@ class WeldingTestService extends ChangeNotifier {
       _filterWelderNo = '';
       _filterPkgNo = '';
       _filterSheetNo = '';
+      _filterIsoNos = [];
+      _isoSearchNoMatch = false;
+      _dailyReportsProjectId = '';
     }
 
     currentProjectId = projectId;
@@ -129,7 +132,56 @@ class WeldingTestService extends ChangeNotifier {
   String get filterPkgNo => _filterPkgNo;
   String get filterSheetNo => _filterSheetNo;
 
+  // =========================================================
+  // ISO(DWG_NAME) 검색
+  //
+  // 화면에서 검색어로 도면 이름을 먼저 골라(로컬, Everything 방식)
+  // 그 도면들만 Firestore에서 'in' 조건으로 불러온다. (최대 30개)
+  // =========================================================
+
+  static const int maxIsoSearchNames = 30;
+
+  List<String> _filterIsoNos = [];
+
+  // 검색어에 맞는 도면이 없을 때: 조회하지 않고 빈 목록
+  bool _isoSearchNoMatch = false;
+
+  List<String> get filterIsoNos => _filterIsoNos;
+
+  bool get isIsoSearchActive =>
+      _filterIsoNos.isNotEmpty || _isoSearchNoMatch;
+
+  Future<void> applyIsoNoSearch({
+    required String projectId,
+    required List<String> isoNos,
+  }) async {
+    _filterIsoNos = isoNos.take(maxIsoSearchNames).toList();
+    _isoSearchNoMatch = isoNos.isEmpty;
+
+    await loadWeldingLogs(projectId);
+  }
+
+  Future<void> clearIsoNoSearch(
+    String projectId,
+  ) async {
+    if (!isIsoSearchActive) {
+      return;
+    }
+
+    _filterIsoNos = [];
+    _isoSearchNoMatch = false;
+
+    await loadWeldingLogs(projectId);
+  }
+
+  // 공사일보는 현장당 한 번만 읽는다 (검색할 때마다 다시 읽지 않음)
+  String _dailyReportsProjectId = '';
+
+  // 빠르게 검색어를 바꿀 때 늦게 도착한 이전 결과 무시
+  int _logQueryToken = 0;
+
   bool get hasWeldingLogFilter =>
+      isIsoSearchActive ||
       _filterCode.isNotEmpty ||
       _filterCommodity.isNotEmpty ||
       _filterFloor.isNotEmpty ||
@@ -237,7 +289,12 @@ class WeldingTestService extends ChangeNotifier {
       );
     }
 
-    if (_filterIsoNo.isNotEmpty) {
+    if (_filterIsoNos.isNotEmpty) {
+      query = query.where(
+        'isoNo',
+        whereIn: _filterIsoNos,
+      );
+    } else if (_filterIsoNo.isNotEmpty) {
       query = query.where(
         'isoNo',
         isEqualTo: _filterIsoNo,
@@ -301,12 +358,26 @@ class WeldingTestService extends ChangeNotifier {
 
     notifyListeners();
 
+    final token = ++_logQueryToken;
+
+    // 검색어에 맞는 도면 없음 → 조회 안 함
+    if (_isoSearchNoMatch) {
+      isLoadingLogs = false;
+      notifyListeners();
+      return;
+    }
+
     try {
       final query =
           _buildWeldingLogQuery(projectId);
 
       final snapshot =
           await query.limit(_firstPageSize).get();
+
+      // 그 사이 검색어가 바뀌었으면 이 결과는 버린다
+      if (token != _logQueryToken) {
+        return;
+      }
 
       final loaded = snapshot.docs.map(
         (doc) {
@@ -338,10 +409,18 @@ class WeldingTestService extends ChangeNotifier {
       hasNextWeldingLogPage =
           snapshot.docs.length == _firstPageSize;
 
-      await _loadDailyReports(
-        projectId,
-      );
+      if (_dailyReportsProjectId != projectId) {
+        await _loadDailyReports(
+          projectId,
+        );
+
+        _dailyReportsProjectId = projectId;
+      }
     } catch (e) {
+      if (token != _logQueryToken) {
+        return;
+      }
+
       debugPrint(
         'Welding Log 첫 페이지 불러오기 실패: $e',
       );
@@ -1115,6 +1194,96 @@ class WeldingTestService extends ChangeNotifier {
     }
   }
 
+  // =========================================================
+  // Welding Log 도면 목록 (weldingLogMeta 1건만 읽기)
+  //
+  // 엑셀 업로드 때 저장한 DWG_NAME 목록.
+  // =========================================================
+
+  Future<List<String>> getWeldingDwgNames(
+    String projectId,
+  ) async {
+    try {
+      final meta = await _firestore
+          .collection('weldingLogMeta')
+          .doc(
+            Uri.encodeComponent(
+              projectId,
+            ),
+          )
+          .get();
+
+      final raw = meta.data()?['dwgNames'];
+
+      if (raw is! List) {
+        return [];
+      }
+
+      return raw
+          .map((e) => e.toString())
+          .where((e) => e.isNotEmpty)
+          .toList();
+    } catch (e) {
+      debugPrint('Welding 도면 목록 조회 실패: $e');
+      return [];
+    }
+  }
+
+  // =========================================================
+  // Welding 도면 목록 다시 만들기 (관리자용, 1회)
+  //
+  // dwgNames가 생기기 전에 엑셀을 올린 현장은 목록이 비어 있다.
+  // 엑셀을 다시 올리지 않고 현재 Welding Log에서 도면 이름만 모아 저장한다.
+  // 주의: 그 현장 Welding Log 전체를 1번 읽는다. (M15X 약 5만 건)
+  // =========================================================
+
+  Future<int> rebuildWeldingDwgNames(
+    String projectId,
+  ) async {
+    final snapshot = await _firestore
+        .collection('weldingLogs')
+        .where(
+          'projectId',
+          isEqualTo: projectId,
+        )
+        .where(
+          'active',
+          isEqualTo: true,
+        )
+        .get();
+
+    final names = snapshot.docs
+        .map((doc) => doc.data()['isoNo']?.toString().trim() ?? '')
+        .where((name) => name.isNotEmpty)
+        .toSet()
+        .toList()
+      ..sort();
+
+    await _firestore
+        .collection('weldingLogMeta')
+        .doc(
+          Uri.encodeComponent(
+            projectId,
+          ),
+        )
+        .set(
+      {
+        'projectId': projectId,
+        'dwgNames': names,
+        'updatedAt': FieldValue.serverTimestamp(),
+      },
+      SetOptions(
+        mergeFields: [
+          'projectId',
+          'dwgNames',
+          'updatedAt',
+        ],
+      ),
+    );
+
+    return names.length;
+  }
+
   // PKG-2, PKG-10처럼 숫자가 들어간 PKG는 숫자 기준으로 정렬한다.
   int _comparePkgNo(
     dynamic a,
@@ -1367,6 +1536,10 @@ class WeldingTestService extends ChangeNotifier {
     final Map<String, Map<String, int>>
         pkgSummary = {};
 
+    // Welding Log에 있는 도면(DWG_NAME) 목록.
+    // ISO 탭에서 PDF가 없어도 도면을 띄우는 데 사용.
+    final Set<String> dwgNames = {};
+
     int duplicated = 0;
 
     int unchanged = 0;
@@ -1557,6 +1730,10 @@ class WeldingTestService extends ChangeNotifier {
               ?.toString()
               .trim() ??
           '';
+
+      if (data['active'] == true) {
+        dwgNames.add(isoNo);
+      }
 
       if (effectivePkgNo.isNotEmpty &&
           data['active'] == true) {
@@ -1754,6 +1931,8 @@ class WeldingTestService extends ChangeNotifier {
         // 도면 화면에서는 weldingLogs 전체가 아니라 이 문서 1건만 읽는다.
         'pkgProgress':
             pkgSummary,
+        'dwgNames':
+            (dwgNames.toList()..sort()),
         'updatedAt':
             FieldValue.serverTimestamp(),
       },
@@ -1766,6 +1945,7 @@ class WeldingTestService extends ChangeNotifier {
           'headers',
           'headerRowIndex',
           'pkgProgress',
+          'dwgNames',
           'updatedAt',
         ],
       ),

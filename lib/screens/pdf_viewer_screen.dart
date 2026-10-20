@@ -1,17 +1,24 @@
 import 'dart:math' as math;
+import 'dart:typed_data';
 
 import 'package:flutter/material.dart';
 import 'package:flutter/gestures.dart';
 import 'package:pdfx/pdfx.dart';
 
 class PDFViewerScreen extends StatefulWidget {
+  // assets 안의 PDF 경로 (앱에 포함된 도면)
   final String pdfPath;
   final String title;
+
+  // 앱에서 업로드한 ISO처럼 메모리에서 여는 PDF.
+  // 값이 있으면 pdfPath 대신 이것을 연다.
+  final Future<Uint8List>? pdfBytes;
 
   const PDFViewerScreen({
     super.key,
     required this.pdfPath,
     required this.title,
+    this.pdfBytes,
   });
 
   @override
@@ -52,9 +59,13 @@ class _PDFViewerScreenState extends State<PDFViewerScreen> {
   void initState() {
     super.initState();
 
-    final documentFuture = PdfDocument.openAsset(
-      widget.pdfPath,
-    );
+    final documentFuture = widget.pdfBytes != null
+        ? PdfDocument.openData(
+            widget.pdfBytes!,
+          )
+        : PdfDocument.openAsset(
+            widget.pdfPath,
+          );
 
     pdfController = PdfControllerPinch(
       document: documentFuture,
