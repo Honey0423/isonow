@@ -76,13 +76,15 @@ def build_iso(iso_dir):
         # -----------------------------------------
         # Revision 추출
         #
-        # 예:
-        # OD25-POW-E-0038-01_Rev00.pdf
-        # OD25-POW-E-0038-01_Rev01.pdf
+        # 새 규칙 (앱 업로드와 같음):
+        #   1F-15A-...-9011-01-REV1.pdf → REV1
+        # 예전 규칙도 읽음:
+        #   OD25-POW-E-0038-01_Rev01.pdf
+        # 리비전 표기가 없으면 기존 도면 = REV0 (revisionNumber 0)
         # -----------------------------------------
 
         revision_match = re.search(
-            r"_Rev(\d+)$",
+            r"[-_]Rev(\d+)$",
             base_name,
             re.IGNORECASE
         )
@@ -90,19 +92,14 @@ def build_iso(iso_dir):
         if revision_match:
             revision_number = int(revision_match.group(1))
 
-            iso_name = re.sub(
-                r"_Rev\d+$",
-                "",
-                base_name,
-                flags=re.IGNORECASE
-            )
+            iso_name = base_name[: revision_match.start()]
 
-            revision = f"Rev.{revision_number:02d}"
+            revision = f"REV{revision_number}"
 
         else:
-            revision_number = -1
+            revision_number = 0
             iso_name = base_name
-            revision = "Rev.?"
+            revision = "REV0"
 
         iso_files.append({
             "fileName": file_name,

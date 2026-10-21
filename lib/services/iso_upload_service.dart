@@ -21,20 +21,92 @@ import 'package:flutter/foundation.dart';
 //   files: [ {docId, fileName, isoName, revision, revisionNumber,
 //             size, modifiedDate, uploadedBy}, ... ]
 //
+// projects/{projectId}/isoHistory/{autoId}
+//   action: upload / replace / delete
+//   fileName, isoName, revision, notInList, by, at
+//
 // 목록은 index 문서 1건만 읽고,
 // PDF는 열 때만 해당 문서 1건을 읽는다.
+//
+// 파일명 규칙 (필수):
+//   {도면번호}-REV{숫자}.pdf
+//   예) 1F-15A-CDA(IA)-ST1-N-9011-01-REV1.pdf
+//       → 도면 1F-15A-CDA(IA)-ST1-N-9011-01 / REV1
+//   (REV0, REV1, REV2 ... 앞에 0 없이 · 같은 도면에 같은 번호는 1개만)
 // =============================================================
+
+// 업로드 전 검사 결과
+enum IsoCandidateStatus {
+  // 바로 업로드 가능
+  ok,
+
+  // 업로드 가능하지만 ISO 목록(Welding Log 등)에 없는 도면 → 강제 추가
+  notInList,
+
+  // 업로드 불가
+  invalidName,
+  duplicateRevision,
+  tooLarge,
+  deletedMark,
+  duplicateDownload,
+  duplicateInBatch,
+}
+
+class IsoUploadCandidate {
+  final String fileName;
+  final Uint8List bytes;
+  final String isoName;
+  final String revision;
+  final int revisionNumber;
+  final IsoCandidateStatus status;
+
+  // 같은 파일명이 이미 올라가 있으면 교체
+  final bool replaces;
+
+  IsoUploadCandidate({
+    required this.fileName,
+    required this.bytes,
+    required this.isoName,
+    required this.revision,
+    required this.revisionNumber,
+    required this.status,
+    required this.replaces,
+  });
+
+  bool get canUpload =>
+      status == IsoCandidateStatus.ok ||
+      status == IsoCandidateStatus.notInList;
+
+  String get statusText {
+    switch (status) {
+      case IsoCandidateStatus.ok:
+        return replaces ? '교체' : '업로드';
+      case IsoCandidateStatus.notInList:
+        return '목록에 없음 → 강제 추가';
+      case IsoCandidateStatus.invalidName:
+        return '제외: 파일명 끝에 -REV0, -REV1 형식 필요 (앞에 0 붙이지 않음)';
+      case IsoCandidateStatus.duplicateRevision:
+        return '제외: 이미 등록된 리비전 ($revision) · 바꾸려면 기존 것을 먼저 삭제';
+      case IsoCandidateStatus.tooLarge:
+        return '제외: ${(bytes.length / 1024 / 1024).toStringAsFixed(1)}MB (1MB 초과)';
+      case IsoCandidateStatus.deletedMark:
+        return '제외: ■삭제 파일';
+      case IsoCandidateStatus.duplicateDownload:
+        return '제외: 중복 다운로드 파일 (1)';
+      case IsoCandidateStatus.duplicateInBatch:
+        return '제외: 같은 도면·리비전을 2번 넣음';
+    }
+  }
+}
 
 class IsoUploadResult {
   final List<String> uploaded;
   final List<String> replaced;
-  final List<String> skipped;
   final List<String> failed;
 
   IsoUploadResult({
     required this.uploaded,
     required this.replaced,
-    required this.skipped,
     required this.failed,
   });
 }
@@ -71,6 +143,28 @@ class IsoUploadService {
         .collection('projects')
         .doc(projectId)
         .collection('isoFiles');
+  }
+
+  CollectionReference<Map<String, dynamic>> _historyRef(
+    String projectId,
+  ) {
+    return _firestore
+        .collection('projects')
+        .doc(projectId)
+        .collection('isoHistory');
+  }
+
+  String _actor(String? userName) {
+    final email = _auth.currentUser?.email ?? '';
+    final name = userName?.trim() ?? '';
+
+    if (name.isNotEmpty && email.isNotEmpty) {
+      return '$name ($email)';
+    }
+
+    return name.isNotEmpty
+        ? name
+        : (email.isNotEmpty ? email : (_auth.currentUser?.uid ?? ''));
   }
 
   // =========================================================
@@ -129,97 +223,199 @@ class IsoUploadService {
   }
 
   // =========================================================
-  // 파일 선택 → 업로드
-  //
-  // PDF 여러 개 또는 ZIP(안의 PDF 전부)을 한 번에 올릴 수 있다.
+  // 파일 선택 (끌어다 놓기가 안 될 때 보조용)
   // =========================================================
 
-  Future<IsoUploadResult?> pickAndUpload({
-    required String projectId,
-    void Function(int done, int total)? onProgress,
-  }) async {
+  Future<List<({String name, Uint8List bytes})>> pickRawFiles() async {
     final picked = await FilePicker.pickFiles(
       type: FileType.custom,
       allowedExtensions: ['pdf', 'zip'],
     );
 
-    if (picked.isEmpty) {
-      return null;
-    }
-
-    final List<({String name, Uint8List bytes})> pdfs = [];
-    final List<String> skipped = [];
+    final result = <({String name, Uint8List bytes})>[];
 
     for (final file in picked) {
-      final bytes = await file.readAsBytes();
+      result.add((
+        name: file.name,
+        bytes: await file.readAsBytes(),
+      ));
+    }
+
+    return result;
+  }
+
+  // =========================================================
+  // ZIP 풀기: PDF만 꺼내서 목록으로
+  // =========================================================
+
+  List<({String name, Uint8List bytes})> expandZips(
+    List<({String name, Uint8List bytes})> files,
+  ) {
+    final result = <({String name, Uint8List bytes})>[];
+
+    for (final file in files) {
       final lower = file.name.toLowerCase();
 
-      if (lower.endsWith('.zip')) {
-        try {
-          final archive =
-              ZipDecoder().decodeBytes(bytes);
+      if (lower.endsWith('.pdf')) {
+        result.add(file);
+        continue;
+      }
 
-          for (final entry in archive.files) {
-            if (!entry.isFile) {
-              continue;
-            }
+      if (!lower.endsWith('.zip')) {
+        continue;
+      }
 
-            // 폴더 경로 제거
-            final name = entry.name
-                .split('/')
-                .last
-                .split('\\')
-                .last;
+      try {
+        final archive =
+            ZipDecoder().decodeBytes(file.bytes);
 
-            if (!name.toLowerCase().endsWith('.pdf') ||
-                name.startsWith('._')) {
-              continue;
-            }
-
-            pdfs.add((
-              name: name,
-              bytes: Uint8List.fromList(
-                entry.content as List<int>,
-              ),
-            ));
+        for (final entry in archive.files) {
+          if (!entry.isFile) {
+            continue;
           }
-        } catch (e) {
-          debugPrint('ZIP 읽기 실패: $e');
-          skipped.add('${file.name} (ZIP 읽기 실패)');
+
+          // 폴더 경로 제거
+          final name = entry.name
+              .split('/')
+              .last
+              .split('\\')
+              .last;
+
+          if (!name.toLowerCase().endsWith('.pdf') ||
+              name.startsWith('._')) {
+            continue;
+          }
+
+          result.add((
+            name: name,
+            bytes: Uint8List.fromList(
+              entry.content as List<int>,
+            ),
+          ));
         }
-      } else if (lower.endsWith('.pdf')) {
-        pdfs.add((name: file.name, bytes: bytes));
+      } catch (e) {
+        debugPrint('ZIP 읽기 실패 ${file.name}: $e');
       }
     }
 
-    final result = await uploadPdfs(
-      projectId: projectId,
-      pdfs: pdfs,
-      onProgress: onProgress,
-    );
-
-    return IsoUploadResult(
-      uploaded: result.uploaded,
-      replaced: result.replaced,
-      skipped: [...skipped, ...result.skipped],
-      failed: result.failed,
-    );
+    return result;
   }
 
-  Future<IsoUploadResult> uploadPdfs({
+  // =========================================================
+  // 업로드 전 검사
+  //
+  // knownIsoNames: 화면 ISO 목록에 있는 도면 이름
+  //   (Welding Log 도면 + 앱 포함 도면 + 업로드한 도면)
+  // =========================================================
+
+  //
+  // existingRevisions: 이미 있는 '도면이름|리비전번호'
+  //   (앱 포함 도면 REV0 + 화면에 보이는 업로드 도면)
+  //   서버의 최신 업로드 목록도 여기서 다시 읽어 합친다.
+  // =========================================================
+
+  Future<List<IsoUploadCandidate>> checkFiles({
     required String projectId,
-    required List<({String name, Uint8List bytes})> pdfs,
+    required List<({String name, Uint8List bytes})> files,
+    required Set<String> knownIsoNames,
+    Set<String> existingRevisions = const {},
+  }) async {
+    final existing = await loadIndex(projectId);
+
+    final takenRevisions = <String>{
+      ...existingRevisions,
+      for (final item in existing)
+        revisionKey(
+          item['isoName']?.toString() ?? '',
+          (item['revisionNumber'] as num?)?.toInt() ?? 0,
+        ),
+    };
+
+    final seen = <String>{};
+    final result = <IsoUploadCandidate>[];
+
+    for (final file in files) {
+      final fileName = file.name.trim();
+      final stem = fileName.replaceAll(
+        RegExp(r'\.pdf$', caseSensitive: false),
+        '',
+      );
+
+      final parsed = parseRevision(stem);
+
+      IsoCandidateStatus status;
+
+      if (fileName.contains('■삭제')) {
+        status = IsoCandidateStatus.deletedMark;
+      } else if (RegExp(r'\s*\(\d+\)$').hasMatch(stem)) {
+        status = IsoCandidateStatus.duplicateDownload;
+      } else if (parsed == null) {
+        status = IsoCandidateStatus.invalidName;
+      } else if (!seen.add(
+        revisionKey(parsed.isoName, parsed.revisionNumber),
+      )) {
+        status = IsoCandidateStatus.duplicateInBatch;
+      } else if (takenRevisions.contains(
+        revisionKey(parsed.isoName, parsed.revisionNumber),
+      )) {
+        status = IsoCandidateStatus.duplicateRevision;
+      } else if (file.bytes.length > maxPdfBytes) {
+        status = IsoCandidateStatus.tooLarge;
+      } else if (!knownIsoNames.contains(parsed.isoName)) {
+        status = IsoCandidateStatus.notInList;
+      } else {
+        status = IsoCandidateStatus.ok;
+      }
+
+      result.add(
+        IsoUploadCandidate(
+          fileName: fileName,
+          bytes: file.bytes,
+          isoName: parsed?.isoName ?? stem,
+          revision: parsed?.revision ?? '',
+          revisionNumber: parsed?.revisionNumber ?? -1,
+          status: status,
+          // 같은 리비전은 막으므로 교체는 없다 (삭제 후 다시 업로드)
+          replaces: false,
+        ),
+      );
+    }
+
+    // 업로드 가능 → 경고 → 제외 순, 같은 그룹은 이름순
+    int rank(IsoUploadCandidate c) =>
+        c.status == IsoCandidateStatus.ok
+            ? 0
+            : c.status == IsoCandidateStatus.notInList
+                ? 1
+                : 2;
+
+    result.sort((a, b) {
+      final r = rank(a).compareTo(rank(b));
+      return r != 0 ? r : a.fileName.compareTo(b.fileName);
+    });
+
+    return result;
+  }
+
+  // =========================================================
+  // 업로드 (검사 통과한 것만)
+  // =========================================================
+
+  Future<IsoUploadResult> uploadCandidates({
+    required String projectId,
+    required List<IsoUploadCandidate> candidates,
+    String? userName,
     void Function(int done, int total)? onProgress,
   }) async {
     final uploaded = <String>[];
     final replaced = <String>[];
-    final skipped = <String>[];
     final failed = <String>[];
 
-    final uploader =
-        _auth.currentUser?.email ?? _auth.currentUser?.uid ?? '';
-
+    final actor = _actor(userName);
     final today = _formatDate(DateTime.now());
+
+    final targets =
+        candidates.where((c) => c.canUpload).toList();
 
     // 기존 목록 (같은 파일명은 덮어쓰기)
     final existing = await loadIndex(projectId);
@@ -229,74 +425,65 @@ class IsoUploadService {
         (item['fileName']?.toString() ?? ''): item,
     };
 
-    final Set<String> seenInBatch = {};
-
     int done = 0;
 
-    for (final pdf in pdfs) {
-      final fileName = pdf.name.trim();
-      final stem = fileName.replaceAll(
-        RegExp(r'\.pdf$', caseSensitive: false),
-        '',
-      );
+    for (final c in targets) {
+      try {
+        final old = byFileName[c.fileName];
+        final oldDocId = old?['docId']?.toString() ?? '';
 
-      // ■삭제 파일 제외
-      if (fileName.contains('■삭제')) {
-        skipped.add('$fileName (■삭제)');
-      }
-      // 중복 다운로드 파일 제외: "xxx (1).pdf"
-      else if (RegExp(r'\s*\(\d+\)$').hasMatch(stem)) {
-        skipped.add('$fileName (중복 다운로드 파일)');
-      } else if (!seenInBatch.add(fileName)) {
-        skipped.add('$fileName (같은 파일 2번 선택)');
-      } else if (pdf.bytes.length > maxPdfBytes) {
-        skipped.add(
-          '$fileName (${(pdf.bytes.length / 1024 / 1024).toStringAsFixed(1)}MB, 1MB 초과)',
-        );
-      } else {
-        try {
-          final parsed = _parseRevision(stem);
+        final ref = oldDocId.isNotEmpty
+            ? _filesRef(projectId).doc(oldDocId)
+            : _filesRef(projectId).doc();
 
-          final old = byFileName[fileName];
-          final oldDocId = old?['docId']?.toString() ?? '';
+        final entry = <String, dynamic>{
+          'docId': ref.id,
+          'fileName': c.fileName,
+          'isoName': c.isoName,
+          'revision': c.revision,
+          'revisionNumber': c.revisionNumber,
+          'size': c.bytes.length,
+          'modifiedDate': today,
+          'uploadedBy': actor,
+        };
 
-          final ref = oldDocId.isNotEmpty
-              ? _filesRef(projectId).doc(oldDocId)
-              : _filesRef(projectId).doc();
+        // PDF 저장 + 히스토리 기록을 한 번에
+        final batch = _firestore.batch();
 
-          final entry = <String, dynamic>{
-            'docId': ref.id,
-            'fileName': fileName,
-            'isoName': parsed.isoName,
-            'revision': parsed.revision,
-            'revisionNumber': parsed.revisionNumber,
-            'size': pdf.bytes.length,
-            'modifiedDate': today,
-            'uploadedBy': uploader,
-          };
+        batch.set(ref, {
+          ...entry,
+          'projectId': projectId,
+          'data': Blob(c.bytes),
+          'uploadedAt': FieldValue.serverTimestamp(),
+        });
 
-          await ref.set({
-            ...entry,
-            'projectId': projectId,
-            'data': Blob(pdf.bytes),
-            'uploadedAt': FieldValue.serverTimestamp(),
-          });
+        batch.set(_historyRef(projectId).doc(), {
+          'action': old != null ? 'replace' : 'upload',
+          'fileName': c.fileName,
+          'isoName': c.isoName,
+          'revision': c.revision,
+          'notInList': c.status == IsoCandidateStatus.notInList,
+          'size': c.bytes.length,
+          'by': actor,
+          'at': FieldValue.serverTimestamp(),
+        });
 
-          byFileName[fileName] = entry;
+        await batch.commit();
 
-          if (old != null) {
-            replaced.add(fileName);
-          } else {
-            uploaded.add(fileName);
-          }
-        } catch (e) {
-          debugPrint('ISO 업로드 실패 $fileName: $e');
-          failed.add(fileName);
+        byFileName[c.fileName] = entry;
+
+        if (old != null) {
+          replaced.add(c.fileName);
+        } else {
+          uploaded.add(c.fileName);
         }
+      } catch (e) {
+        debugPrint('ISO 업로드 실패 ${c.fileName}: $e');
+        failed.add(c.fileName);
       }
 
       done++;
-      onProgress?.call(done, pdfs.length);
+      onProgress?.call(done, targets.length);
     }
 
     // 목록 문서 갱신 (실패가 있어도 성공한 것은 반영)
@@ -327,7 +514,6 @@ class IsoUploadService {
     return IsoUploadResult(
       uploaded: uploaded,
       replaced: replaced,
-      skipped: skipped,
       failed: failed,
     );
   }
@@ -335,30 +521,37 @@ class IsoUploadService {
   // =========================================================
   // 업로드 ISO 삭제
   //
-  // PDF 문서 삭제 + 목록 문서에서 제거 (쓰기 2건)
+  // PDF 문서 삭제 + 목록에서 제거 + 히스토리 기록 (한 번에)
   // 앱에 포함된 assets 도면은 여기서 지울 수 없다.
   // =========================================================
 
   Future<void> deleteIso({
     required String projectId,
     required String docId,
+    String? userName,
   }) async {
     final indexRef = _indexRef(projectId);
+    final actor = _actor(userName);
 
     await _firestore.runTransaction((transaction) async {
       final snapshot = await transaction.get(indexRef);
 
       final files = snapshot.data()?['files'];
 
-      final remaining = files is List
+      final all = files is List
           ? files
               .whereType<Map>()
-              .where(
-                (item) => item['docId']?.toString() != docId,
-              )
               .map((item) => Map<String, dynamic>.from(item))
               .toList()
           : <Map<String, dynamic>>[];
+
+      final target = all
+          .where((item) => item['docId']?.toString() == docId)
+          .firstOrNull;
+
+      final remaining = all
+          .where((item) => item['docId']?.toString() != docId)
+          .toList();
 
       transaction.set(indexRef, {
         'projectId': projectId,
@@ -369,38 +562,96 @@ class IsoUploadService {
       transaction.delete(
         _filesRef(projectId).doc(docId),
       );
+
+      transaction.set(_historyRef(projectId).doc(), {
+        'action': 'delete',
+        'fileName': target?['fileName'] ?? '',
+        'isoName': target?['isoName'] ?? '',
+        'revision': target?['revision'] ?? '',
+        'by': actor,
+        'at': FieldValue.serverTimestamp(),
+      });
     });
   }
 
   // =========================================================
-  // Revision 추출 (tools/generate_pdf_metadata.py와 같은 규칙)
-  //
-  // OD25-POW-E-0038-01_Rev01.pdf → OD25-POW-E-0038-01 / Rev.01
+  // 히스토리 (최근 N건)
   // =========================================================
 
-  ({String isoName, String revision, int revisionNumber})
-      _parseRevision(String stem) {
-    final match = RegExp(
-      r'_Rev(\d+)$',
-      caseSensitive: false,
-    ).firstMatch(stem);
+  // from/to(날짜, 포함)를 주면 그 기간만 서버에서 읽는다.
+  Future<List<Map<String, dynamic>>> loadHistory(
+    String projectId, {
+    DateTime? from,
+    DateTime? to,
+    int limit = 300,
+  }) async {
+    Query<Map<String, dynamic>> query = _historyRef(projectId);
 
-    if (match == null) {
-      return (
-        isoName: stem,
-        revision: 'Rev.?',
-        revisionNumber: -1,
+    if (from != null) {
+      query = query.where(
+        'at',
+        isGreaterThanOrEqualTo: Timestamp.fromDate(
+          DateTime(from.year, from.month, from.day),
+        ),
       );
     }
 
-    final number = int.parse(match.group(1)!);
+    if (to != null) {
+      query = query.where(
+        'at',
+        isLessThan: Timestamp.fromDate(
+          DateTime(to.year, to.month, to.day + 1),
+        ),
+      );
+    }
+
+    final snapshot = await query
+        .orderBy('at', descending: true)
+        .limit(limit)
+        .get();
+
+    return snapshot.docs
+        .map((doc) => {...doc.data(), 'id': doc.id})
+        .toList();
+  }
+
+  // =========================================================
+  // Revision 추출
+  //
+  // {도면번호}-REV{숫자}  (대소문자 무관, 필수)
+  // 1F-15A-...-9011-01-REV1 → 1F-15A-...-9011-01 / REV1 / 1
+  // REV01처럼 앞에 0이 붙으면 규칙 위반 (null)
+  // 규칙에 안 맞으면 null
+  // =========================================================
+
+  static ({String isoName, String revision, int revisionNumber})?
+      parseRevision(String stem) {
+    final match = RegExp(
+      r'^(.+)-REV(0|[1-9]\d*)$',
+      caseSensitive: false,
+    ).firstMatch(stem.trim());
+
+    if (match == null) {
+      return null;
+    }
+
+    final isoName = match.group(1)!.trim();
+    final number = int.parse(match.group(2)!);
+
+    if (isoName.isEmpty) {
+      return null;
+    }
 
     return (
-      isoName: stem.substring(0, match.start),
-      revision: 'Rev.${number.toString().padLeft(2, '0')}',
+      isoName: isoName,
+      revision: 'REV$number',
       revisionNumber: number,
     );
   }
+
+  // 도면 + 리비전 중복 판단 키 (대소문자 무시)
+  static String revisionKey(String isoName, int revisionNumber) =>
+      '${isoName.trim().toLowerCase()}|$revisionNumber';
 
   String _formatDate(DateTime date) {
     return '${date.year}-'

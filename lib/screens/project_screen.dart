@@ -5,6 +5,7 @@ import 'package:firebase_auth/firebase_auth.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
+import 'iso_upload_dialog.dart';
 import 'pdf_viewer_screen.dart';
 import '../services/iso_upload_service.dart';
 import '../services/welding_test_service.dart';
@@ -54,11 +55,9 @@ class _ProjectScreenState extends State<ProjectScreen>
   bool isWeldingDwgLoaded = false;
   bool isRebuildingDwgNames = false;
 
-  // ISO 탭 보기: 'all' = 전체, 'welding' = Welding Log 도면만
-  String isoViewFilter = 'all';
+  // PDF 미등록 도면만 보기 (Welding Log에는 있는데 PDF가 없는 것)
+  bool showNoPdfOnly = false;
 
-  bool isUploadingIso = false;
-  String isoUploadProgress = '';
 
   final IsoUploadService isoUploadService =
       IsoUploadService.instance;
@@ -185,8 +184,10 @@ class _ProjectScreenState extends State<ProjectScreen>
 
   Future<void> loadMetadata() async {
     try {
-      final loadedIsoFiles =
-          await _loadSiteMetadata('iso_metadata.json');
+      // 리비전 표기 없는 기존 도면은 REV0으로 본다.
+      final loadedIsoFiles = _normalizeRevisions(
+        await _loadSiteMetadata('iso_metadata.json'),
+      );
 
       final loadedPkgFiles =
           await _loadSiteMetadata('pkg_metadata.json');
@@ -273,8 +274,27 @@ class _ProjectScreenState extends State<ProjectScreen>
     if (!mounted) return;
 
     setState(() {
-      uploadedIsoFiles = result;
+      uploadedIsoFiles = _normalizeRevisions(result);
     });
+  }
+
+  // 표시 이름을 리비전 번호로 통일: REV0, REV1, REV2 ...
+  // (번호가 없으면(-1) 기존 도면 = REV0, 예전 표기 REV01/Rev.01도 REV1로)
+  List<Map<String, dynamic>> _normalizeRevisions(
+    List<Map<String, dynamic>> files,
+  ) {
+    return files.map((item) {
+      final number =
+          (item['revisionNumber'] as num?)?.toInt() ?? -1;
+
+      final fixed = number < 0 ? 0 : number;
+
+      return {
+        ...item,
+        'revisionNumber': fixed,
+        'revision': 'REV$fixed',
+      };
+    }).toList();
   }
 
   Future<void> loadWeldingDwgNames() async {
@@ -293,11 +313,6 @@ class _ProjectScreenState extends State<ProjectScreen>
       weldingDwgNames = result;
       weldingDwgNameSet = result.toSet();
       isWeldingDwgLoaded = true;
-
-      // Welding 도면이 있으면 공사일보 기입용 목록을 기본으로 보여준다.
-      if (result.isNotEmpty) {
-        isoViewFilter = 'welding';
-      }
     });
   }
 
@@ -405,6 +420,7 @@ class _ProjectScreenState extends State<ProjectScreen>
       await isoUploadService.deleteIso(
         projectId: widget.projectId,
         docId: docId,
+        userName: weldingService.currentUserName,
       );
 
       await loadUploadedIsos();
@@ -445,103 +461,44 @@ class _ProjectScreenState extends State<ProjectScreen>
   // =========================================================
 
   Future<void> _uploadIsos() async {
-    if (!_canManageIso || isUploadingIso) {
+    if (!_canManageIso) {
       return;
     }
 
-    setState(() {
-      isUploadingIso = true;
-      isoUploadProgress = '파일 읽는 중...';
-    });
+    // "목록에 없는 도면" 판단 기준: 지금 ISO 탭에 있는 모든 도면 이름
+    final knownIsoNames = <String>{
+      ...weldingDwgNames,
+      ...isoFiles.map((e) => e['isoName']?.toString() ?? ''),
+      ...uploadedIsoFiles.map((e) => e['isoName']?.toString() ?? ''),
+    }..remove('');
 
-    try {
-      final result =
-          await isoUploadService.pickAndUpload(
-        projectId: widget.projectId,
-        onProgress: (done, total) {
-          if (!mounted) return;
+    // 이미 있는 리비전 (같은 도면 + 같은 리비전은 업로드 불가)
+    final existingRevisions = <String>{
+      for (final item in [...isoFiles, ...uploadedIsoFiles])
+        IsoUploadService.revisionKey(
+          item['isoName']?.toString() ?? '',
+          (item['revisionNumber'] as num?)?.toInt() ?? 0,
+        ),
+    };
 
-          setState(() {
-            isoUploadProgress =
-                '업로드 중 $done / $total';
-          });
-        },
-      );
+    final uploaded = await showIsoUploadDialog(
+      context: context,
+      projectId: widget.projectId,
+      knownIsoNames: knownIsoNames,
+      existingRevisions: existingRevisions,
+      userName: weldingService.currentUserName,
+    );
 
-      if (result == null || !mounted) {
-        return;
-      }
-
+    if (uploaded) {
       await loadUploadedIsos();
-
-      if (!mounted) return;
-
-      await showDialog<void>(
-        context: context,
-        builder: (dialogContext) {
-          return AlertDialog(
-            title: const Text('ISO 업로드 결과'),
-            content: SizedBox(
-              width: 450,
-              child: SingleChildScrollView(
-                child: Column(
-                  mainAxisSize: MainAxisSize.min,
-                  crossAxisAlignment:
-                      CrossAxisAlignment.start,
-                  children: [
-                    Text(
-                      '신규 ${result.uploaded.length}개 · '
-                      '교체 ${result.replaced.length}개 · '
-                      '제외 ${result.skipped.length}개 · '
-                      '실패 ${result.failed.length}개',
-                      style: const TextStyle(
-                        fontWeight: FontWeight.bold,
-                      ),
-                    ),
-                    if (result.skipped.isNotEmpty) ...[
-                      const SizedBox(height: 12),
-                      const Text('제외된 파일'),
-                      ...result.skipped.map(
-                        (name) => Text(
-                          '· $name',
-                          style: const TextStyle(fontSize: 12),
-                        ),
-                      ),
-                    ],
-                    if (result.failed.isNotEmpty) ...[
-                      const SizedBox(height: 12),
-                      const Text('실패한 파일 (다시 올려주세요)'),
-                      ...result.failed.map(
-                        (name) => Text(
-                          '· $name',
-                          style: const TextStyle(fontSize: 12),
-                        ),
-                      ),
-                    ],
-                  ],
-                ),
-              ),
-            ),
-            actions: [
-              FilledButton(
-                onPressed: () =>
-                    Navigator.of(dialogContext).pop(),
-                child: const Text('확인'),
-              ),
-            ],
-          );
-        },
-      );
-    } catch (e) {
-      _showMessage('ISO 업로드 실패\n$e');
-    } finally {
-      if (mounted) {
-        setState(() {
-          isUploadingIso = false;
-          isoUploadProgress = '';
-        });
-      }
     }
+  }
+
+  void _showIsoHistory() {
+    showIsoHistoryDialog(
+      context: context,
+      projectId: widget.projectId,
+    );
   }
 
   // =========================================================
@@ -584,9 +541,10 @@ class _ProjectScreenState extends State<ProjectScreen>
       for (final key in sortedKeys)
         key: grouped[key]!
           ..sort(
-            (a, b) => ((a['revisionNumber'] as num?) ?? -1)
+            // 최신 리비전(번호 큰 것)이 왼쪽
+            (a, b) => ((b['revisionNumber'] as num?) ?? -1)
                 .compareTo(
-              (b['revisionNumber'] as num?) ?? -1,
+              (a['revisionNumber'] as num?) ?? -1,
             ),
           ),
     };
@@ -608,14 +566,13 @@ class _ProjectScreenState extends State<ProjectScreen>
   }
 
   Map<String, List<Map<String, dynamic>>> getFilteredIsos() {
+    // 하나의 목록: Welding Log 도면 + 앱 포함 도면 + 업로드 도면
     var grouped = groupByIso();
 
-    // Welding Log 도면만 보기
-    if (isoViewFilter == 'welding') {
+    if (showNoPdfOnly) {
       grouped = {
         for (final entry in grouped.entries)
-          if (weldingDwgNameSet.contains(entry.key))
-            entry.key: entry.value,
+          if (entry.value.isEmpty) entry.key: entry.value,
       };
     }
 
@@ -747,6 +704,12 @@ class _ProjectScreenState extends State<ProjectScreen>
     final entries =
         filteredIsos.entries.toList();
 
+    // 검색과 상관없이 전체 중 PDF 미등록 개수
+    final noPdfCount = groupByIso()
+        .values
+        .where((revisions) => revisions.isEmpty)
+        .length;
+
     return Column(
       children: [
         // =================================================
@@ -764,9 +727,7 @@ class _ProjectScreenState extends State<ProjectScreen>
             child: Row(
               children: [
                 FilledButton.icon(
-                  onPressed: isUploadingIso
-                      ? null
-                      : _uploadIsos,
+                  onPressed: _uploadIsos,
                   icon: const Icon(
                     Icons.upload_file,
                     size: 18,
@@ -776,13 +737,24 @@ class _ProjectScreenState extends State<ProjectScreen>
                   ),
                 ),
 
+                const SizedBox(width: 8),
+
+                OutlinedButton.icon(
+                  onPressed: _showIsoHistory,
+                  icon: const Icon(
+                    Icons.history,
+                    size: 18,
+                  ),
+                  label: const Text(
+                    '히스토리',
+                  ),
+                ),
+
                 const SizedBox(width: 12),
 
                 Expanded(
                   child: Text(
-                    isUploadingIso
-                        ? isoUploadProgress
-                        : 'PDF 여러 개 또는 ZIP 선택 가능 · 파일당 1MB 이하 · 같은 파일명은 교체',
+                    '파일명: 도면번호-REV0.pdf, -REV1.pdf ... · 끌어다 놓기 · 최신 리비전이 왼쪽',
                     style: TextStyle(
                       fontSize: 12,
                       color: Colors.grey.shade600,
@@ -794,64 +766,76 @@ class _ProjectScreenState extends State<ProjectScreen>
             ),
           ),
 
-        if (isUploadingIso)
-          const Padding(
-            padding: EdgeInsets.fromLTRB(20, 8, 20, 0),
-            child: LinearProgressIndicator(
-              minHeight: 2,
-            ),
-          ),
 
         // =================================================
-        // 보기 전환: Welding Log 도면(공사일보용) / 전체
+        // 도면 개수 (Welding Log 도면 + 업로드/포함 도면을 한 목록으로)
         // =================================================
 
-        if (SHOW_WELDING_FEATURES)
-          Padding(
-            padding: const EdgeInsets.fromLTRB(
-              20,
-              10,
-              20,
-              0,
-            ),
-            child: Row(
-              children: [
-                ChoiceChip(
-                  label: Text(
-                    'Welding Log 도면 (${weldingDwgNames.length})',
-                  ),
-                  selected: isoViewFilter == 'welding',
-                  onSelected: (_) {
-                    setState(() {
-                      isoViewFilter = 'welding';
-                    });
-                  },
-                ),
-
-                const SizedBox(width: 8),
-
-                ChoiceChip(
-                  label: const Text('전체'),
-                  selected: isoViewFilter == 'all',
-                  onSelected: (_) {
-                    setState(() {
-                      isoViewFilter = 'all';
-                    });
-                  },
-                ),
-
-                const Spacer(),
-
-                Text(
-                  '${entries.length}개',
-                  style: TextStyle(
-                    fontSize: 12,
-                    color: Colors.grey.shade600,
-                  ),
-                ),
-              ],
-            ),
+        Padding(
+          padding: const EdgeInsets.fromLTRB(
+            20,
+            10,
+            20,
+            0,
           ),
+          child: Wrap(
+            spacing: 8,
+            runSpacing: 6,
+            crossAxisAlignment: WrapCrossAlignment.center,
+            children: [
+              ChoiceChip(
+                label: const Text('전체'),
+                selected: !showNoPdfOnly,
+                onSelected: (_) {
+                  setState(() {
+                    showNoPdfOnly = false;
+                  });
+                },
+              ),
+
+              ChoiceChip(
+                avatar: Icon(
+                  Icons.picture_as_pdf_outlined,
+                  size: 16,
+                  color: Colors.orange.shade800,
+                ),
+                label: Text('PDF 미등록 $noPdfCount'),
+                selected: showNoPdfOnly,
+                onSelected: (_) {
+                  setState(() {
+                    showNoPdfOnly = true;
+                  });
+                },
+              ),
+
+              Text(
+                showNoPdfOnly
+                    ? '${entries.length}개 · Welding Log에는 있지만 PDF가 없는 도면'
+                    : '도면 ${entries.length}개'
+                        '${SHOW_WELDING_FEATURES && weldingDwgNames.isNotEmpty ? ' (Welding Log 도면 ${weldingDwgNames.length}개 포함)' : ''}',
+                style: TextStyle(
+                  fontSize: 12,
+                  color: Colors.grey.shade700,
+                ),
+              ),
+
+              // 지금 보이는 도면 이름 전부 복사 (줄바꿈 구분, 엑셀에 붙여넣기 가능)
+              if (entries.isNotEmpty)
+                TextButton.icon(
+                  onPressed: () {
+                    Clipboard.setData(
+                      ClipboardData(
+                        text: entries.map((e) => e.key).join('\n'),
+                      ),
+                    );
+                    _showMessage('도면 이름 ${entries.length}개를 복사했습니다.');
+                  },
+                  icon: const Icon(Icons.copy_all, size: 16),
+                  label: const Text('목록 복사'),
+                ),
+            ],
+          ),
+        ),
 
         // Welding 도면 목록이 아직 없을 때 (관리자에게만 버튼)
         if (SHOW_WELDING_FEATURES &&
@@ -909,17 +893,20 @@ class _ProjectScreenState extends State<ProjectScreen>
                   ),
                 )
               // 도면이 수천 개라 화면에 보이는 것만 그린다.
-              : ListView.builder(
-                  padding: const EdgeInsets.all(20),
-                  itemCount: entries.length,
-                  itemBuilder: (context, index) {
-                    final entry = entries[index];
+              // SelectionArea: 도면 이름을 마우스로 끌어서 선택 / 복사 가능
+              : SelectionArea(
+                  child: ListView.builder(
+                    padding: const EdgeInsets.all(20),
+                    itemCount: entries.length,
+                    itemBuilder: (context, index) {
+                      final entry = entries[index];
 
-                    return _buildIsoCard(
-                      entry.key,
-                      entry.value,
-                    );
-                  },
+                      return _buildIsoCard(
+                        entry.key,
+                        entry.value,
+                      );
+                    },
+                  ),
                 ),
         ),
       ],
@@ -947,13 +934,34 @@ class _ProjectScreenState extends State<ProjectScreen>
             Row(
               children: [
                 Expanded(
-                  child: Text(
-                    isoName,
-                    style: const TextStyle(
-                      fontSize: 15,
-                      fontWeight:
-                          FontWeight.bold,
-                    ),
+                  child: Row(
+                    children: [
+                      Flexible(
+                        child: Text(
+                          isoName,
+                          style: const TextStyle(
+                            fontSize: 15,
+                            fontWeight:
+                                FontWeight.bold,
+                          ),
+                        ),
+                      ),
+                      IconButton(
+                        tooltip: '도면 이름 복사',
+                        visualDensity: VisualDensity.compact,
+                        iconSize: 16,
+                        icon: Icon(
+                          Icons.copy,
+                          color: Colors.grey.shade500,
+                        ),
+                        onPressed: () {
+                          Clipboard.setData(
+                            ClipboardData(text: isoName),
+                          );
+                          _showMessage('복사했습니다: $isoName');
+                        },
+                      ),
+                    ],
                   ),
                 ),
 
@@ -1026,7 +1034,7 @@ class _ProjectScreenState extends State<ProjectScreen>
     Map<String, dynamic> iso,
   ) {
     final revision =
-        iso['revision']?.toString() ?? 'Rev.?';
+        iso['revision']?.toString() ?? 'REV0';
 
     final modifiedDate =
         iso['modifiedDate']?.toString() ?? '';
@@ -3644,6 +3652,20 @@ class _ProjectScreenState extends State<ProjectScreen>
         title: Text(
           widget.projectName,
         ),
+        actions: [
+          // 다른 컴퓨터에서 올린 ISO / 엑셀을 바로 반영 (문서 2건 읽기)
+          IconButton(
+            tooltip: '새로고침',
+            icon: const Icon(Icons.refresh),
+            onPressed: () async {
+              await Future.wait([
+                loadUploadedIsos(),
+                loadWeldingDwgNames(),
+              ]);
+              _showMessage('도면 목록을 새로 불러왔습니다.');
+            },
+          ),
+        ],
       ),
       body: isLoading
           ? const Center(

@@ -92,7 +92,8 @@ class WeldingTestService extends ChangeNotifier {
   // =========================================================
 
   static const int _firstPageSize = 20;
-  static const int _nextPageSize = 10;
+  // 다음 페이지도 첫 페이지와 같은 개수
+  static const int _nextPageSize = 20;
 
   int currentWeldingLogPage = 1;
 
@@ -159,6 +160,12 @@ class WeldingTestService extends ChangeNotifier {
     _isoSearchNoMatch = isoNos.isEmpty;
 
     await loadWeldingLogs(projectId);
+  }
+
+  // 화면에 다시 들어올 때 이전 검색이 남지 않도록 (조회 없이 초기화)
+  void resetIsoNoSearch() {
+    _filterIsoNos = [];
+    _isoSearchNoMatch = false;
   }
 
   Future<void> clearIsoNoSearch(

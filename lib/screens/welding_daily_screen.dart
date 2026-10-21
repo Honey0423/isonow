@@ -61,6 +61,9 @@ class _WeldingDailyScreenState
       projectName: widget.projectName,
     );
 
+    // 검색창은 새로 비어 있으므로 이전 검색 조건도 지운다.
+    service.resetIsoNoSearch();
+
     service.addListener(
       _onDataChanged,
     );

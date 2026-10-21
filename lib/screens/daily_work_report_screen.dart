@@ -42,9 +42,12 @@ class _DailyWorkReportScreenState
 
   DateTime _selectedDate = _dateOnly(DateTime.now());
 
-  // 읽어둔 범위
-  DateTime? _rangeStart;
-  DateTime? _rangeEnd;
+  // 달력에 보이는 달 (달력 ◀ ▶로 따로 넘길 수 있음)
+  DateTime _calendarMonth = _monthStart(DateTime.now());
+
+  // 읽어둔 달 ('yyyy-MM')과 달별 데이터
+  final Set<String> _loadedMonths = {};
+  final Map<String, List<Map<String, dynamic>>> _reportsByMonth = {};
 
   List<Map<String, dynamic>> _reports = [];
 
@@ -154,28 +157,27 @@ class _DailyWorkReportScreenState
   // 달력에 표시하는 달 + 선택 기간을 모두 덮는 범위를 읽는다.
   // =========================================================
 
+  // 달 단위로 읽어서 모아둔다. 이미 읽은 달은 다시 읽지 않는다.
   Future<void> _ensureLoaded({
     bool force = false,
   }) async {
-    final periodStart = _periodStart;
-    final periodEnd = _periodEnd;
+    final months = <DateTime>{
+      _monthStart(_periodStart),
+      _monthStart(_periodEnd),
+      _calendarMonth,
+    };
 
-    final calStart = _monthStart(_selectedDate);
-    final calEnd = _monthEnd(_selectedDate);
+    if (force) {
+      _loadedMonths.clear();
+      _reportsByMonth.clear();
+    }
 
-    final needStart =
-        periodStart.isBefore(calStart) ? periodStart : calStart;
-    final needEnd =
-        periodEnd.isAfter(calEnd) ? periodEnd : calEnd;
+    final missing = months
+        .where((m) => !_loadedMonths.contains(_monthKey(m)))
+        .toList();
 
-    final loadedStart = _rangeStart;
-    final loadedEnd = _rangeEnd;
-
-    if (!force &&
-        loadedStart != null &&
-        loadedEnd != null &&
-        !needStart.isBefore(loadedStart) &&
-        !needEnd.isAfter(loadedEnd)) {
+    if (missing.isEmpty) {
+      if (force) setState(_rebuildReports);
       return;
     }
 
@@ -185,30 +187,33 @@ class _DailyWorkReportScreenState
     });
 
     try {
-      final snapshot = await _firestore
-          .collection('weldingDailyReports')
-          .where(
-            'projectId',
-            isEqualTo: widget.projectId,
-          )
-          .where(
-            'date',
-            isGreaterThanOrEqualTo: _fmt(needStart),
-          )
-          .where(
-            'date',
-            isLessThanOrEqualTo: _fmt(needEnd),
-          )
-          .get();
+      for (final month in missing) {
+        final snapshot = await _firestore
+            .collection('weldingDailyReports')
+            .where(
+              'projectId',
+              isEqualTo: widget.projectId,
+            )
+            .where(
+              'date',
+              isGreaterThanOrEqualTo: _fmt(month),
+            )
+            .where(
+              'date',
+              isLessThanOrEqualTo: _fmt(_monthEnd(month)),
+            )
+            .get();
+
+        _reportsByMonth[_monthKey(month)] = snapshot.docs
+            .map((doc) => {...doc.data(), 'id': doc.id})
+            .toList();
+        _loadedMonths.add(_monthKey(month));
+      }
 
       if (!mounted) return;
 
       setState(() {
-        _reports = snapshot.docs
-            .map((doc) => {...doc.data(), 'id': doc.id})
-            .toList();
-        _rangeStart = needStart;
-        _rangeEnd = needEnd;
+        _rebuildReports();
         _isLoading = false;
       });
     } catch (e) {
@@ -223,11 +228,21 @@ class _DailyWorkReportScreenState
     }
   }
 
+  String _monthKey(DateTime d) =>
+      '${d.year}-${d.month.toString().padLeft(2, '0')}';
+
+  void _rebuildReports() {
+    _reports = _reportsByMonth.values
+        .expand((list) => list)
+        .toList();
+  }
+
   void _setSelected(DateTime date, {_PeriodMode? mode}) {
     final today = _today;
 
     setState(() {
       _selectedDate = date.isAfter(today) ? today : _dateOnly(date);
+      _calendarMonth = _monthStart(_selectedDate);
       if (mode != null) _mode = mode;
     });
 
@@ -530,7 +545,7 @@ class _DailyWorkReportScreenState
                       _buildSectionTitle('용접사별', byWelder.length),
                       _buildGroupTable(
                         firstHeader: '용접사',
-                        subHeader: 'ISO',
+                        subHeader: 'Line No.',
                         groups: byWelder,
                       ),
 
@@ -816,6 +831,24 @@ class _DailyWorkReportScreenState
     );
   }
 
+  void _moveCalendar(int months) {
+    final target = DateTime(
+      _calendarMonth.year,
+      _calendarMonth.month + months,
+      1,
+    );
+
+    if (target.isAfter(_today)) {
+      return;
+    }
+
+    setState(() {
+      _calendarMonth = target;
+    });
+
+    _ensureLoaded();
+  }
+
   // =========================================================
   // 달력 (선택한 날짜가 속한 달)
   //
@@ -825,8 +858,8 @@ class _DailyWorkReportScreenState
 
   Widget _buildCalendar() {
     final byDate = _byDate;
-    final monthStart = _monthStart(_selectedDate);
-    final monthEnd = _monthEnd(_selectedDate);
+    final monthStart = _calendarMonth;
+    final monthEnd = _monthEnd(_calendarMonth);
     final gridStart = _weekStart(monthStart);
     final today = _today;
 
@@ -937,12 +970,26 @@ class _DailyWorkReportScreenState
           children: [
             Row(
               children: [
+                IconButton(
+                  tooltip: '지난달',
+                  visualDensity: VisualDensity.compact,
+                  icon: const Icon(Icons.chevron_left),
+                  onPressed: () => _moveCalendar(-1),
+                ),
                 Text(
                   '${monthStart.year}년 ${monthStart.month}월',
                   style: const TextStyle(
                     fontSize: 15,
                     fontWeight: FontWeight.bold,
                   ),
+                ),
+                IconButton(
+                  tooltip: '다음달',
+                  visualDensity: VisualDensity.compact,
+                  icon: const Icon(Icons.chevron_right),
+                  onPressed: _monthStart(_today) == monthStart
+                      ? null
+                      : () => _moveCalendar(1),
                 ),
                 const Spacer(),
                 Text(
